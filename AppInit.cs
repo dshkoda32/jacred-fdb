@@ -112,6 +112,8 @@ namespace JacRed
         public TrackerSettings Animelayer = new TrackerSettings("http://animelayer.ru");
 
         public TrackerSettings Anifilm = new TrackerSettings("https://anifilm.net");
+        
+        public TrackerSettings Anidub = new TrackerSettings("https://tr.anidub.com");
 
         public TrackerSettings Rezka = new TrackerSettings("https://rezka.cc");
 
