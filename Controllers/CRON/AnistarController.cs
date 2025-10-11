@@ -38,6 +38,9 @@ namespace JacRed.Controllers.CRON
 
             var pagesLog = new List<string>();
 
+            // нормализуем хост из конфига
+            string origin = NormalizeOrigin(AppInit.conf.Anistar.rqHost());
+
             var categories = new[]
             {
                 new { path = "anime",  types = new[] { "anime"  } },
@@ -49,13 +52,13 @@ namespace JacRed.Controllers.CRON
             {
                 foreach (var cat in categories)
                 {
-                    int lastPage = await DetectLastPage(cat.path, limit_page);
+                    int lastPage = await DetectLastPage(origin, cat.path, limit_page);
 
                     for (int page = 1; page <= lastPage; page++)
                     {
                         string listUrl = page == 1
-                            ? $"{AppInit.conf.Anistar.host}/{cat.path}/"
-                            : $"{AppInit.conf.Anistar.host}/{cat.path}/page/{page}/";
+                            ? $"{origin}/{cat.path}/"
+                            : $"{origin}/{cat.path}/page/{page}/";
 
                         pagesLog.Add(listUrl);
                         pagesTotal++;
@@ -64,18 +67,26 @@ namespace JacRed.Controllers.CRON
                         if (listHtml == null)
                             continue;
 
-                        // Посты вида https://anistar.org/12345-some-title.html
-                        var postLinks = Regex.Matches(listHtml, @"https:\/\/anistar\.org\/\d{2,}-[^""'>]+?\.html", RegexOptions.IgnoreCase)
-                                             .Cast<Match>()
-                                             .Select(m => m.Value)
-                                             .Distinct()
-                                             .ToList();
+                        // 1) Абсолютные ссылки на текущий домен
+                        string hostRe = Regex.Escape(new Uri(origin).Host);
+                        string absPostPattern = $@"https?://{hostRe}/\d{{2,}}-[^""'>]+?\.html";
+                        var postUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (Match m in Regex.Matches(listHtml, absPostPattern, RegexOptions.IgnoreCase))
+                            postUrls.Add(m.Value);
 
-                        postsTotal += postLinks.Count;
+                        // 2) Относительные ссылки ("/12345-....html") — конвертируем в абсолютные
+                        foreach (Match m in Regex.Matches(listHtml, @"/\d{2,}-[^""'>]+?\.html", RegexOptions.IgnoreCase))
+                        {
+                            string rel = m.Value;
+                            if (!rel.StartsWith("/")) continue;
+                            postUrls.Add(origin + rel);
+                        }
+
+                        postsTotal += postUrls.Count;
 
                         var batch = new List<TorrentDetails>();
 
-                        foreach (string postUrl in postLinks)
+                        foreach (string postUrl in postUrls)
                         {
                             string postHtml = await HttpClient.Get(postUrl,
                                 useproxy: AppInit.conf.Anistar.useproxy,
@@ -204,12 +215,15 @@ namespace JacRed.Controllers.CRON
                                     return false;
                                 }
 
+                                string nowOrigin = NormalizeOrigin(AppInit.conf.Anistar.rqHost());
+                                string downUrl = $"{nowOrigin}/engine/gettorrent.php?id={id}";
+
                                 // 5× с паузой 1 мин.
                                 for (int i = 0; i < 5; i++)
                                 {
                                     byte[] tor = await HttpClient.Download(
-                                        $"{AppInit.conf.Anistar.host}/engine/gettorrent.php?id={id}",
-                                        referer: AppInit.conf.Anistar.host,
+                                        downUrl,
+                                        referer: nowOrigin,
                                         useproxy: AppInit.conf.Anistar.useproxy);
 
                                     string magnet = BencodeTo.Magnet(tor);
@@ -228,8 +242,8 @@ namespace JacRed.Controllers.CRON
                                 for (int i = 0; i < 5; i++)
                                 {
                                     byte[] tor = await HttpClient.Download(
-                                        $"{AppInit.conf.Anistar.host}/engine/gettorrent.php?id={id}",
-                                        referer: AppInit.conf.Anistar.host,
+                                        downUrl,
+                                        referer: nowOrigin,
                                         useproxy: AppInit.conf.Anistar.useproxy);
 
                                     string magnet = BencodeTo.Magnet(tor);
@@ -283,12 +297,12 @@ namespace JacRed.Controllers.CRON
         /// Определяет число страниц по пагинации .pagenav/.pages (…/page/NNN/).
         /// Если limit_page > 0 — используем его.
         /// </summary>
-        async Task<int> DetectLastPage(string cat, int limit_page)
+        async Task<int> DetectLastPage(string origin, string cat, int limit_page)
         {
             if (limit_page > 0)
                 return limit_page;
 
-            string url = $"{AppInit.conf.Anistar.host}/{cat}/";
+            string url = $"{origin}/{cat}/";
             string html = await HttpClient.Get(url, useproxy: AppInit.conf.Anistar.useproxy);
             if (html == null)
                 return 1;
@@ -300,6 +314,20 @@ namespace JacRed.Controllers.CRON
                             .ToList();
 
             return nums.Count == 0 ? 1 : nums.Max();
+        }
+
+        static string NormalizeOrigin(string hostFromConf)
+        {
+            string h = hostFromConf?.Trim() ?? "";
+            if (string.IsNullOrEmpty(h))
+                h = AppInit.conf.Anistar.rqHost();
+
+            if (!h.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !h.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                h = "https://" + h;
+
+            var u = new Uri(h);
+            return u.GetLeftPart(UriPartial.Authority).TrimEnd('/');
         }
     }
 }
