@@ -114,6 +114,8 @@ namespace JacRed
         public TrackerSettings Anifilm = new TrackerSettings("https://anifilm.net");
         
         public TrackerSettings Anidub = new TrackerSettings("https://tr.anidub.com");
+        
+        public TrackerSettings Anistar = new TrackerSettings("https://anistar.org");
 
         public TrackerSettings Rezka = new TrackerSettings("https://rezka.cc");
 
