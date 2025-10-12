@@ -117,8 +117,6 @@ namespace JacRed
         
         public TrackerSettings Anistar = new TrackerSettings("https://anistar.org");
 
-        public TrackerSettings Rezka = new TrackerSettings("https://rezka.cc");
-
         public TrackerSettings Baibako = new TrackerSettings("http://baibako.tv");
 
         public TrackerSettings Lostfilm = new TrackerSettings("https://www.lostfilm.tv");
