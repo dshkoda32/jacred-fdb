@@ -16,7 +16,8 @@ namespace JacRed.Controllers.CRON
     {
         #region LostfilmController
         static System.Net.Http.HttpClient cloudHttp;
-
+        static string cloudHost = AppInit.conf.Lostfilm.rqHost() + "/";
+        
         static LostfilmController() 
         {
             //var handler = new ClearanceHandler("http://ip:8191/")
@@ -24,25 +25,26 @@ namespace JacRed.Controllers.CRON
             //    UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36",
             //    MaxTimeout = 60000
             //};
-
+            
             cloudHttp = new System.Net.Http.HttpClient(); // handler
             cloudHttp.Timeout = TimeSpan.FromSeconds(20);
             cloudHttp.MaxResponseContentBufferSize = 10_000_000;
-            cloudHttp.DefaultRequestHeaders.Add("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36");
+            cloudHttp.DefaultRequestHeaders.Add("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7");
+            cloudHttp.DefaultRequestHeaders.Add("accept-encoding", "gzip, deflate, br, zstd");
+            cloudHttp.DefaultRequestHeaders.Add("accept-language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7");
+            cloudHttp.DefaultRequestHeaders.Add("cache-control", "max-age=0");
             cloudHttp.DefaultRequestHeaders.Add("cookie", AppInit.conf.Lostfilm.cookie);
-
-            cloudHttp.DefaultRequestHeaders.Add("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9");
-            cloudHttp.DefaultRequestHeaders.Add("accept-language", "ru-RU,ru;q=0.9,uk-UA;q=0.8,uk;q=0.7,en-US;q=0.6,en;q=0.5");
-            cloudHttp.DefaultRequestHeaders.Add("cache-control", "no-cache");
-            cloudHttp.DefaultRequestHeaders.Add("dnt", "1");
-            cloudHttp.DefaultRequestHeaders.Add("pragma", "no-cache");
-            cloudHttp.DefaultRequestHeaders.Add("sec-ch-ua", "\"Chromium\";v=\"92\", \" Not A;Brand\";v=\"99\", \"Google Chrome\";v=\"92\"");
-            cloudHttp.DefaultRequestHeaders.Add("sec-ch-ua-mobile", "?0");
+            cloudHttp.DefaultRequestHeaders.Add("priority", "u=0, i");
+            cloudHttp.DefaultRequestHeaders.Add("referer", cloudHost);
+            cloudHttp.DefaultRequestHeaders.Add("sec-ch-ua", "\"Google Chrome\";v=\"141\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"141\"");
+            cloudHttp.DefaultRequestHeaders.Add("sec-ch-ua-mobile", "?1");
+            cloudHttp.DefaultRequestHeaders.Add("sec-ch-ua-platform", "\"Android\"");
             cloudHttp.DefaultRequestHeaders.Add("sec-fetch-dest", "document");
             cloudHttp.DefaultRequestHeaders.Add("sec-fetch-mode", "navigate");
-            cloudHttp.DefaultRequestHeaders.Add("sec-fetch-site", "none");
+            cloudHttp.DefaultRequestHeaders.Add("sec-fetch-site", "same-origin");
             cloudHttp.DefaultRequestHeaders.Add("sec-fetch-user", "?1");
             cloudHttp.DefaultRequestHeaders.Add("upgrade-insecure-requests", "1");
+            cloudHttp.DefaultRequestHeaders.Add("user-agent", "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36");
         }
         #endregion
 
