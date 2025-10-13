@@ -19,6 +19,11 @@ namespace JacRed.Controllers.CRON
     [Route("/cron/lostfilm/[action]")]
     public class LostfilmController : BaseController
     {
+        // === Управление логированием ===
+        // По умолчанию — тихий режим (только финальный summary).
+        static bool _verbose = false;
+        static void VLog(string msg) { if (_verbose) Console.WriteLine(msg); }
+
         #region Hosts & Aggregators
         static string lfHost => AppInit.conf.Lostfilm.rqHost();
 
@@ -97,10 +102,7 @@ namespace JacRed.Controllers.CRON
         {
             var sb = new StringBuilder();
             foreach (byte b in bytes)
-            {
-                sb.Append('%');
-                sb.Append(b.ToString("X2"));
-            }
+                sb.Append('%').Append(b.ToString("X2"));
             return sb.ToString();
         }
 
@@ -198,7 +200,7 @@ namespace JacRed.Controllers.CRON
                                 ? resp.Headers.Location.AbsoluteUri
                                 : new Uri(new Uri(current), resp.Headers.Location).AbsoluteUri;
 
-                            Console.WriteLine($"[lostfilm] v_search redirect {i + 1}: {next}");
+                            VLog($"[lostfilm] v_search redirect {i + 1}: {next}");
                             if (next.Contains("insearch", StringComparison.OrdinalIgnoreCase) ||
                                 next.Contains("tracktor", StringComparison.OrdinalIgnoreCase))
                                 return next;
@@ -219,7 +221,7 @@ namespace JacRed.Controllers.CRON
                             if (!next.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                                 next = new Uri(new Uri(current), next).AbsoluteUri;
 
-                            Console.WriteLine($"[lostfilm] v_search meta-refresh: {next}");
+                            VLog($"[lostfilm] v_search meta-refresh: {next}");
                             if (next.Contains("insearch", StringComparison.OrdinalIgnoreCase) ||
                                 next.Contains("tracktor", StringComparison.OrdinalIgnoreCase))
                                 return next;
@@ -237,7 +239,7 @@ namespace JacRed.Controllers.CRON
                             if (!next.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                                 next = new Uri(new Uri(current), next).AbsoluteUri;
 
-                            Console.WriteLine($"[lostfilm] v_search window.location: {next}");
+                            VLog($"[lostfilm] v_search window.location: {next}");
                             if (next.Contains("insearch", StringComparison.OrdinalIgnoreCase) ||
                                 next.Contains("tracktor", StringComparison.OrdinalIgnoreCase))
                                 return next;
@@ -252,7 +254,7 @@ namespace JacRed.Controllers.CRON
                         if (m3.Success)
                         {
                             string next = m3.Groups[2].Value.Trim();
-                            Console.WriteLine($"[lostfilm] v_search url=: {next}");
+                            VLog($"[lostfilm] v_search url=: {next}");
                             if (next.Contains("insearch", StringComparison.OrdinalIgnoreCase) ||
                                 next.Contains("tracktor", StringComparison.OrdinalIgnoreCase))
                                 return next;
@@ -262,7 +264,7 @@ namespace JacRed.Controllers.CRON
                             continue;
                         }
 
-                        Console.WriteLine($"[lostfilm] v_search no final URL on step {i + 1}");
+                        VLog($"[lostfilm] v_search no final URL on step {i + 1}");
                         return null;
                     }
                 }
@@ -315,7 +317,7 @@ namespace JacRed.Controllers.CRON
             foreach (Match m in re2.Matches(flat)) candidates.Add((m.Groups[1].Value, m.Groups[2].Value));
             foreach (Match m in re3.Matches(flat)) candidates.Add((m.Groups[1].Value, ""));
 
-            Console.WriteLine($"[lostfilm] agg links: {candidates.Count}");
+            VLog($"[lostfilm] agg links: {candidates.Count}");
 
             var seenMagnets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -331,7 +333,7 @@ namespace JacRed.Controllers.CRON
                     useproxy: AppInit.conf.Lostfilm.useproxy
                 );
 
-                Console.WriteLine($"[lostfilm] torrent GET {(torrent?.Length ?? 0)} from {link}");
+                VLog($"[lostfilm] torrent GET {(torrent?.Length ?? 0)} from {link}");
 
                 if (torrent == null || torrent.Length == 0)
                     continue;
@@ -408,7 +410,7 @@ namespace JacRed.Controllers.CRON
 
             if (string.IsNullOrWhiteSpace(fullNews))
             {
-                Console.WriteLine($"[lostfilm] EMPTY episode page: {url}");
+                VLog($"[lostfilm] EMPTY episode page: {url}");
                 return all;
             }
 
@@ -424,7 +426,7 @@ namespace JacRed.Controllers.CRON
                 seriesId = pe3.Groups["c"].Value;
                 season   = pe3.Groups["s"].Value;
                 episode  = pe3.Groups["e"].Value;
-                Console.WriteLine($"[lostfilm] PlayEpisode c/s/e: {seriesId}/{season}/{episode}");
+                VLog($"[lostfilm] PlayEpisode c/s/e: {seriesId}/{season}/{episode}");
             }
             else
             {
@@ -432,7 +434,7 @@ namespace JacRed.Controllers.CRON
                 var se = Regex.Match(url, @"season_(\d+)/episode_(\d+)/", RegexOptions.IgnoreCase);
                 season  = se.Groups[1].Value;
                 episode = se.Groups[2].Value;
-                Console.WriteLine($"[lostfilm] Fallback c/s/e via og+url: {seriesId}/{season}/{episode}");
+                VLog($"[lostfilm] Fallback c/s/e via og+url: {seriesId}/{season}/{episode}");
             }
 
             // v_search → подписанный агрегатор
@@ -442,9 +444,9 @@ namespace JacRed.Controllers.CRON
             if (!string.IsNullOrEmpty(episodeId))
             {
                 string vsearch = $"{lfHost}/v_search.php?a={episodeId}";
-                Console.WriteLine($"[lostfilm] v_search: {vsearch}");
+                VLog($"[lostfilm] v_search: {vsearch}");
                 signedAggUrl = await GetRedirectFinalUrl(vsearch, referer: url, cookie: AppInit.conf.Lostfilm.cookie);
-                Console.WriteLine($"[lostfilm] v_search final: {signedAggUrl}");
+                VLog($"[lostfilm] v_search final: {signedAggUrl}");
             }
 
             // Источники:
@@ -454,7 +456,7 @@ namespace JacRed.Controllers.CRON
             bool haveSigned = !string.IsNullOrWhiteSpace(signedAggUrl);
             if (haveSigned)
             {
-                Console.WriteLine("[lostfilm] using signed aggregator; skip plain fallbacks");
+                VLog("[lostfilm] using signed aggregator; skip plain fallbacks");
                 aggUrls.Add(signedAggUrl);
             }
             else if (!string.IsNullOrWhiteSpace(seriesId) && !string.IsNullOrWhiteSpace(season) && !string.IsNullOrWhiteSpace(episode))
@@ -480,7 +482,7 @@ namespace JacRed.Controllers.CRON
                     }
                 );
 
-                Console.WriteLine($"[lostfilm] agg GET: {aggUrl} len={(shtml?.Length ?? 0)}");
+                VLog($"[lostfilm] agg GET: {aggUrl} len={(shtml?.Length ?? 0)}");
 
                 // отсечём "тонкие" ответы
                 if (string.IsNullOrEmpty(shtml) || shtml.Length < 600)
@@ -506,31 +508,41 @@ namespace JacRed.Controllers.CRON
 
         #region Debug endpoint
         [HttpGet]
-        public async Task<string> debug(string url)
+        public async Task<string> debug(string url, int verbose = 0)
         {
-            var all = await GetAllMagnetsForEpisode(url);
-            var sb = new StringBuilder();
-            sb.AppendLine($"url={url}");
-            sb.AppendLine($"variants={all.Count}");
-            int i = 0;
-            foreach (var v in all)
+            bool old = _verbose; _verbose = verbose != 0;
+            try
             {
-                string q = string.Join(" ", new[] { v.quality, v.rip }.Where(x => !string.IsNullOrWhiteSpace(x)));
-                if (string.IsNullOrWhiteSpace(q)) q = "WEB-DLRip";
-                sb.AppendLine($"[{++i}] {q} | size={v.sizeName} | seeds={v.seeds} peers={v.peers} | magnet={(v.magnet?.Substring(0, Math.Min(60, v.magnet.Length)) ?? "")}...");
+                var all = await GetAllMagnetsForEpisode(url);
+                var sb = new StringBuilder();
+                sb.AppendLine($"url={url}");
+                sb.AppendLine($"variants={all.Count}");
+                int i = 0;
+                foreach (var v in all)
+                {
+                    string q = string.Join(" ", new[] { v.quality, v.rip }.Where(x => !string.IsNullOrWhiteSpace(x)));
+                    if (string.IsNullOrWhiteSpace(q)) q = "WEB-DLRip";
+                    sb.AppendLine($"[{++i}] {q} | size={v.sizeName} | seeds={v.seeds} peers={v.peers} | magnet={(v.magnet?.Substring(0, Math.Min(60, v.magnet.Length)) ?? "")}...");
+                }
+                return sb.ToString();
             }
-            return sb.ToString();
+            finally
+            {
+                _verbose = old;
+            }
         }
         #endregion
 
-        #region Parse (мульти-добавление всех вариантов)
+        #region Parse (мульти-добавление всех вариантов) — только финальный лог по умолчанию
         static bool _workParse = false;
 
-        async public Task<string> Parse(int maxpage = 1)
+        [HttpGet]
+        async public Task<string> Parse(int maxpage = 1, int verbose = 0)
         {
             if (_workParse)
                 return "work";
 
+            bool old = _verbose; _verbose = verbose != 0;
             _workParse = true;
 
             int totalChecked = 0; // эпизодов просмотрено
@@ -549,16 +561,21 @@ namespace JacRed.Controllers.CRON
                     totalFound   += foundVar;
                     totalAdded   += added;
 
-                    Console.WriteLine($"[lostfilm] page {i}: checked={checkedEp}, found={foundVar}, added={added}");
+                    // Лог по страницам — только в verbose
+                    VLog($"[lostfilm] page {i}: checked={checkedEp}, found={foundVar}, added={added}");
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[lostfilm] Parse error: " + ex.Message);
+                VLog("[lostfilm] Parse error: " + ex.Message);
+            }
+            finally
+            {
+                _workParse = false;
+                _verbose = old;
             }
 
             Console.WriteLine($"[lostfilm] summary: checked={totalChecked}, found={totalFound}, added={totalAdded}");
-            _workParse = false;
             return $"ok (checked={totalChecked}, found={totalFound}, added={totalAdded})";
         }
         #endregion
