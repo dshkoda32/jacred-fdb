@@ -271,7 +271,7 @@ namespace JacRed.Controllers.CRON
                         return false;
                     }
 
-                    byte[] tor = await HttpClient.Download($"{AppInit.conf.Anidub.rqHost()}/engine/download.php?id={id}", referer: AppInit.conf.Anidub.host, useproxy: AppInit.conf.Anidub.useproxy);
+                    byte[] tor = await HttpClient.Download($"{AppInit.conf.Anidub.rqHost()}/engine/download.php?id={id}", referer: AppInit.conf.Anidub.rqHost(), useproxy: AppInit.conf.Anidub.useproxy);
                     if (tor == null || tor.Length == 0)
                     {
                         st.TorrentsFailed++;
