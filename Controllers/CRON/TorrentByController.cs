@@ -136,7 +136,25 @@ namespace JacRed.Controllers.CRON
         #region parsePage
         async Task<bool> parsePage(string cat, int page)
         {
-            string html = await HttpClient.Get($"{AppInit.conf.TorrentBy.rqHost()}/{cat}/?page={page}", useproxy: AppInit.conf.TorrentBy.useproxy);
+            string html = await HttpClient.Get($"{AppInit.conf.TorrentBy.rqHost()}/{cat}/?page={page}", useproxy: AppInit.conf.TorrentBy.useproxy, addHeaders: new List<(string name, string val)>() 
+            {
+                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+                ("Accept-Encoding", "gzip, deflate, br, zstd"),
+                ("Accept-Language", "ru,en-US;q=0.9,en;q=0.8,bg;q=0.7"),
+                ("Cache-Control", "no-cache"),
+                ("Connection", "keep-alive"),
+                ("Cookie", AppInit.conf.TorrentBy.cookie),
+                ("Pragma", "no-cache"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Site", "none"),
+                ("Sec-Fetch-User", "?1"),
+                ("Upgrade-Insecure-Requests", "1"),
+                ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 OPR/122.0.0.0"),
+                ("sec-ch-ua", "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Opera\";v=\"122\""),
+                ("sec-ch-ua-mobile", "?0"),
+                ("sec-ch-ua-platform", "Windows")
+            });
             if (html == null)
                 return false;
 
