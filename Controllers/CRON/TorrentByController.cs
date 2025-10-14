@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Web;
@@ -12,88 +13,301 @@ using JacRed.Models.tParse;
 using IO = System.IO;
 using JacRed.Engine;
 using JacRed.Models.Details;
+using Microsoft.Extensions.Caching.Memory;
+using System.Net.Http;
+using System.Net;
+using CoreHttp = JacRed.Engine.CORE.HttpClient;
 
 namespace JacRed.Controllers.CRON
 {
     [Route("/cron/torrentby/[action]")]
-    public class TorrentByController : BaseController
+    public class TorrentByController : Controller
     {
         static Dictionary<string, List<TaskParse>> taskParse = new Dictionary<string, List<TaskParse>>();
+        static readonly object taskLock = new object();
 
         static TorrentByController()
         {
-            if (IO.File.Exists("Data/temp/torrentby_taskParse.json"))
-                taskParse = JsonConvert.DeserializeObject<Dictionary<string, List<TaskParse>>>(IO.File.ReadAllText("Data/temp/torrentby_taskParse.json"));
+            try
+            {
+                if (IO.File.Exists("Data/temp/torrentby_taskParse.json"))
+                    taskParse = JsonConvert.DeserializeObject<Dictionary<string, List<TaskParse>>>(IO.File.ReadAllText("Data/temp/torrentby_taskParse.json"));
+            }
+            catch { }
         }
 
+        readonly IMemoryCache memoryCache;
+        static readonly object rndLock = new object();
+        static readonly Random rnd = new Random();
 
-        #region Parse
-        static bool _workParse = false;
-
-        async public Task<string> Parse(int page)
+        public TorrentByController(IMemoryCache memoryCache)
         {
-            if (_workParse)
-                return "work";
+            this.memoryCache = memoryCache;
+        }
 
-            string log = "";
-            _workParse = true;
+        #region Cookie / Login / Persist
+        static readonly string CookiePath = "Data/temp/torrentby.cookie";
+
+        static string NormalizeCookie(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var piece in raw.Split(';'))
+            {
+                var p = piece?.Trim();
+                if (string.IsNullOrEmpty(p)) continue;
+                var kv = p.Split(new[] { '=' }, 2);
+                if (kv.Length < 2) continue;
+
+                var name = kv[0].Trim();
+                var val = kv[1].Trim().Trim('\"');
+
+                // Skip Set-Cookie attributes
+                if (name.Equals("path", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("domain", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("expires", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("max-age", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("secure", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("httponly", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("samesite", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (name.Length > 0)
+                    dict[name] = val;
+            }
+
+            return string.Join("; ", dict.Select(kv => $"{kv.Key}={kv.Value}"));
+        }
+
+        static void SaveCookie(IMemoryCache memoryCache, string raw)
+        {
+            var norm = NormalizeCookie(raw);
+            if (string.IsNullOrWhiteSpace(norm)) return;
+
+            memoryCache.Set("torrentby:cookie", norm, DateTime.Now.AddDays(1));
+            AppInit.conf.TorrentBy.cookie = norm;
 
             try
             {
-                // films     - Зарубежные фильмы    | Фильмы
-                // movies    - Наши фильмы          | Фильмы
-                // serials   - Сериалы              | Сериалы
-                // tv        - Телевизор            | ТВ Шоу
-                // humor     - Юмор                 | ТВ Шоу
-                // cartoons  - Мультфильмы          | Мультфильмы, Мультсериалы
-                // anime     - Аниме                | Аниме
-                // sport     - Спорт                | Спорт
-                foreach (string cat in new List<string>() { "films", "movies", "serials", "tv", "humor", "cartoons", "anime", "sport" })
+                IO.Directory.CreateDirectory(IO.Path.GetDirectoryName(CookiePath));
+                IO.File.WriteAllText(CookiePath, norm);
+            }
+            catch { }
+        }
+
+        static string LoadCookie(IMemoryCache memoryCache)
+        {
+            if (memoryCache.TryGetValue("torrentby:cookie", out string c) && !string.IsNullOrWhiteSpace(c))
+                return c;
+
+            if (!string.IsNullOrWhiteSpace(AppInit.conf.TorrentBy.cookie))
+            {
+                var n = NormalizeCookie(AppInit.conf.TorrentBy.cookie);
+                if (!string.IsNullOrWhiteSpace(n))
                 {
-                    await parsePage(cat, page);
-                    log += $"{cat} - {page}\n";
+                    SaveCookie(memoryCache, n);
+                    return n;
+                }
+            }
+
+            try
+            {
+                if (IO.File.Exists(CookiePath))
+                {
+                    var fromFile = NormalizeCookie(IO.File.ReadAllText(CookiePath));
+                    if (!string.IsNullOrWhiteSpace(fromFile))
+                    {
+                        SaveCookie(memoryCache, fromFile);
+                        return fromFile;
+                    }
                 }
             }
             catch { }
 
-            _workParse = false;
-            return string.IsNullOrWhiteSpace(log) ? "ok" : log;
+            return null;
         }
-        #endregion
 
-        #region UpdateTasksParse
-        async public Task<string> UpdateTasksParse()
+        async Task<bool> EnsureLogin()
         {
-            foreach (string cat in new List<string>() { "films", "movies", "serials", "tv", "humor", "cartoons", "anime", "sport" })
+            var cookie = LoadCookie(memoryCache);
+            if (!string.IsNullOrEmpty(cookie))
+                return true;
+
+            return await TakeLogin();
+        }
+
+        async Task<bool> TakeLogin()
+        {
+            string authKey = "torrentby:TakeLogin()";
+            if (memoryCache.TryGetValue(authKey, out _))
+                return false;
+
+            memoryCache.Set(authKey, 0, TimeSpan.FromMinutes(2));
+
+            try
             {
-                // Получаем html
-                string html = await HttpClient.Get($"{AppInit.conf.TorrentBy.rqHost()}/{cat}/", timeoutSeconds: 10, useproxy: AppInit.conf.TorrentBy.useproxy);
-                if (html == null)
-                    continue;
+                var handler = new HttpClientHandler { AllowAutoRedirect = false };
+                handler.ServerCertificateCustomValidationCallback += (sender, cert, chain, sslPolicyErrors) => true;
 
-                // Максимальное количиство страниц
-                int.TryParse(Regex.Match(html, "href=\"\\?page=([0-9]+)\">[0-9]+</a>([\t ]+)?</center></td>").Groups[1].Value, out int maxpages);
-
-                if (maxpages > 0)
+                using (var client = new System.Net.Http.HttpClient(handler))
                 {
-                    // Загружаем список страниц в список задач
-                    for (int page = 0; page < maxpages; page++)
-                    {
-                        try
-                        {
-                            if (!taskParse.ContainsKey(cat))
-                                taskParse.Add(cat, new List<TaskParse>());
+                    client.Timeout = TimeSpan.FromSeconds(15);
+                    client.DefaultRequestHeaders.Add("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36");
+                    client.DefaultRequestHeaders.Add("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
 
-                            var val = taskParse[cat];
-                            if (val.Find(i => i.page == page) == null)
-                                val.Add(new TaskParse(page));
+                    var post = new Dictionary<string, string>
+                    {
+                        { "username", AppInit.conf.TorrentBy.login.u },
+                        { "password", AppInit.conf.TorrentBy.login.p }
+                    };
+
+                    using (var content = new FormUrlEncodedContent(post))
+                    {
+                        using (var resp = await client.PostAsync($"{AppInit.conf.TorrentBy.host}/login/", content))
+                        {
+                            if (resp.Headers.TryGetValues("Set-Cookie", out var setCookies))
+                            {
+                                var pairs = setCookies
+                                    .Select(sc => sc?.Split(';')?.FirstOrDefault()?.Trim())
+                                    .Where(s => !string.IsNullOrWhiteSpace(s));
+                                var combined = string.Join("; ", pairs);
+
+                                SaveCookie(memoryCache, combined);
+                                return true;
+                            }
                         }
-                        catch { }
                     }
                 }
             }
+            catch { }
 
-            IO.File.WriteAllText("Data/temp/torrentby_taskParse.json", JsonConvert.SerializeObject(taskParse));
+            return false;
+        }
+        #endregion
+
+        #region Helpers
+        static readonly string[] categories = new[] { "films", "movies", "serials", "tv", "humor", "cartoons", "anime", "sport" };
+
+        static string[] MapTypes(string cat)
+        {
+            switch (cat)
+            {
+                case "films":
+                case "movies":
+                    return new[] { "movie" };
+                case "serials":
+                    return new[] { "serial" };
+                case "tv":
+                case "humor":
+                    return new[] { "tvshow" };
+                case "cartoons":
+                    return new[] { "multfilm", "multserial" };
+                case "anime":
+                    return new[] { "anime" };
+                case "sport":
+                    return new[] { "sport" };
+                default:
+                    return Array.Empty<string>();
+            }
+        }
+
+        async Task DelayWithJitter()
+        {
+            int baseMs = AppInit.conf.TorrentBy.parseDelay;
+            if (baseMs <= 0) baseMs = 1000;
+            int jitter;
+            lock (rndLock) jitter = rnd.Next(250, 1250);
+            await Task.Delay(baseMs + jitter);
+        }
+
+        static string HtmlDecode(string s) => string.IsNullOrEmpty(s) ? s : HttpUtility.HtmlDecode(s);
+        static string StripTags(string s) => string.IsNullOrEmpty(s) ? s : Regex.Replace(s, "<.*?>", string.Empty);
+        #endregion
+
+        #region Parse (manual)
+        static bool workParse = false;
+
+        // /cron/torrentby/parse?page=1
+        [HttpGet]
+        public async Task<string> Parse(int page = 1)
+        {
+            if (workParse) return "work";
+            workParse = true;
+            var sb = new StringBuilder();
+
+            try
+            {
+                await EnsureLogin();
+
+                foreach (var cat in categories)
+                {
+                    bool ok = await parsePage(cat, page);
+                    sb.AppendLine($"{cat} - {(ok ? "ok" : "empty")}");
+                    await DelayWithJitter();
+                }
+            }
+            catch { }
+            finally
+            {
+                workParse = false;
+            }
+
+            return sb.Length == 0 ? "ok" : sb.ToString();
+        }
+        #endregion
+
+        #region UpdateTasksParse (init + daily)
+        static bool _taskWork = false;
+
+        // /cron/torrentby/UpdateTasksParse
+        [HttpGet]
+        public async Task<string> UpdateTasksParse()
+        {
+            if (_taskWork) return "work";
+            _taskWork = true;
+
+            try
+            {
+                await EnsureLogin();
+
+                // init pages plan if empty
+                lock (taskLock)
+                {
+                    foreach (var cat in categories)
+                    {
+                        if (!taskParse.ContainsKey(cat))
+                            taskParse[cat] = Enumerable.Range(1, 10).Select(p => new TaskParse(p)).ToList();
+                    }
+                }
+
+                foreach (var kv in taskParse.ToArray())
+                {
+                    foreach (var tp in kv.Value.OrderBy(a => a.updateTime))
+                    {
+                        if (tp.updateTime.Date == DateTime.Today)
+                            continue;
+
+                        bool res = await parsePage(kv.Key, tp.page);
+                        if (res)
+                            tp.updateTime = DateTime.Today;
+
+                        await DelayWithJitter();
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                _taskWork = false;
+                try
+                {
+                    IO.Directory.CreateDirectory("Data/temp");
+                    IO.File.WriteAllText("Data/temp/torrentby_taskParse.json", JsonConvert.SerializeObject(taskParse));
+                }
+                catch { }
+            }
+
             return "ok";
         }
         #endregion
@@ -101,7 +315,9 @@ namespace JacRed.Controllers.CRON
         #region ParseAllTask
         static bool _parseAllTaskWork = false;
 
-        async public Task<string> ParseAllTask()
+        // /cron/torrentby/ParseAllTask
+        [HttpGet]
+        public async Task<string> ParseAllTask()
         {
             if (_parseAllTaskWork)
                 return "work";
@@ -110,332 +326,201 @@ namespace JacRed.Controllers.CRON
 
             try
             {
+                await EnsureLogin();
+
                 foreach (var task in taskParse.ToArray())
                 {
                     foreach (var val in task.Value.ToArray())
                     {
-                        if (DateTime.Today == val.updateTime)
-                            continue;
+                        try
+                        {
+                            if (DateTime.Today == val.updateTime)
+                                continue;
 
-                        await Task.Delay(AppInit.conf.TorrentBy.parseDelay);
+                            bool res = await parsePage(task.Key, val.page);
+                            if (res)
+                                val.updateTime = DateTime.Today;
 
-                        bool res = await parsePage(task.Key, val.page);
-                        if (res)
-                            val.updateTime = DateTime.Today;
+                            await DelayWithJitter();
+                        }
+                        catch { }
                     }
                 }
             }
             catch { }
+            finally
+            {
+                _parseAllTaskWork = false;
+                try
+                {
+                    IO.Directory.CreateDirectory("Data/temp");
+                    IO.File.WriteAllText("Data/temp/torrentby_taskParse.json", JsonConvert.SerializeObject(taskParse));
+                }
+                catch { }
+            }
 
-            _parseAllTaskWork = false;
             return "ok";
         }
         #endregion
 
-
         #region parsePage
         async Task<bool> parsePage(string cat, int page)
         {
-            string html = await HttpClient.Get($"{AppInit.conf.TorrentBy.rqHost()}/{cat}/?page={page}", useproxy: AppInit.conf.TorrentBy.useproxy, addHeaders: new List<(string name, string val)>() 
-            {
-                ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
-                ("Accept-Encoding", "gzip, deflate, br, zstd"),
-                ("Accept-Language", "ru,en-US;q=0.9,en;q=0.8,bg;q=0.7"),
-                ("Cache-Control", "no-cache"),
-                ("Connection", "keep-alive"),
-                ("Cookie", AppInit.conf.TorrentBy.cookie),
-                ("Pragma", "no-cache"),
-                ("Sec-Fetch-Dest", "document"),
-                ("Sec-Fetch-Mode", "navigate"),
-                ("Sec-Fetch-Site", "none"),
-                ("Sec-Fetch-User", "?1"),
-                ("Upgrade-Insecure-Requests", "1"),
-                ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 OPR/122.0.0.0"),
-                ("sec-ch-ua", "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Opera\";v=\"122\""),
-                ("sec-ch-ua-mobile", "?0"),
-                ("sec-ch-ua-platform", "Windows")
-            });
+            var cookie = LoadCookie(memoryCache);
+
+            string url = $"{AppInit.conf.TorrentBy.rqHost()}/{cat}/?page={page}";
+            string html = await CoreHttp.Get(url,
+                useproxy: AppInit.conf.TorrentBy.useproxy,
+                cookie: cookie,
+                addHeaders: new List<(string name, string val)>
+                {
+                    ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                    ("Accept-Language", "ru,en-US;q=0.9,en;q=0.8"),
+                    ("Cache-Control", "no-cache"),
+                    ("Pragma", "no-cache"),
+                    ("Connection", "keep-alive"),
+                    ("Upgrade-Insecure-Requests", "1"),
+                    ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+                });
+
             if (html == null)
                 return false;
 
-            var torrents = new List<TorrentBaseDetails>();
+            // If we got login page, try re-login once
+            if (html.Contains("name=\"username\"") && html.Contains("name=\"password\""))
+            {
+                await TakeLogin();
+                await Task.Delay(500);
 
+                html = await CoreHttp.Get(url,
+                    useproxy: AppInit.conf.TorrentBy.useproxy,
+                    cookie: LoadCookie(memoryCache));
+                if (html == null)
+                    return false;
+            }
+
+            var torrents = new List<TorrentBaseDetails>();
             foreach (string row in tParse.ReplaceBadNames(html).Split("<tr class=\"ttable_col").Skip(1))
             {
-                #region Локальный метод - Match
-                string Match(string pattern, int index = 1)
-                {
-                    string res = HttpUtility.HtmlDecode(new Regex(pattern, RegexOptions.IgnoreCase).Match(row).Groups[index].Value.Trim());
-                    res = Regex.Replace(res, "[\n\r\t ]+", " ");
-                    return res.Trim();
-                }
-                #endregion
-
                 if (string.IsNullOrWhiteSpace(row) || !row.Contains("magnet:?xt=urn"))
                     continue;
 
-                #region Дата создания
+                string Match(string pattern, int index = 1)
+                {
+                    var m = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Singleline).Match(row);
+                    string res = HtmlDecode(m.Groups.Count > index ? m.Groups[index].Value : string.Empty);
+                    res = Regex.Replace(res ?? string.Empty, "[\\n\\r\\t ]+", " ");
+                    return res.Trim();
+                }
+
+                #region created
                 DateTime createTime = default;
 
-                if (row.Contains(">Сегодня</td>"))
+                // Сегодня / Вчера с временем
+                var mToday = Regex.Match(row, @">Сегодня,?\s*([0-9]{2}):([0-9]{2})<", RegexOptions.IgnoreCase);
+                if (mToday.Success && int.TryParse(mToday.Groups[1].Value, out int th) && int.TryParse(mToday.Groups[2].Value, out int tm))
                 {
-                    createTime = DateTime.UtcNow;
-                }
-                else if (row.Contains(">Вчера</td>"))
-                {
-                    createTime = DateTime.UtcNow.AddDays(-1);
+                    createTime = DateTime.Today.AddHours(th).AddMinutes(tm);
                 }
                 else
                 {
-                    string _createTime = Match(">([0-9]{4}-[0-9]{2}-[0-9]{2})</td>").Replace("-", " ");
-                    if (!DateTime.TryParseExact(_createTime, "yyyy MM dd", new CultureInfo("ru-RU"), DateTimeStyles.None, out createTime))
-                        continue;
+                    var mYesterday = Regex.Match(row, @">Вчера,?\s*([0-9]{2}):([0-9]{2})<", RegexOptions.IgnoreCase);
+                    if (mYesterday.Success && int.TryParse(mYesterday.Groups[1].Value, out int yh) && int.TryParse(mYesterday.Groups[2].Value, out int ym))
+                    {
+                        createTime = DateTime.Today.AddDays(-1).AddHours(yh).AddMinutes(ym);
+                    }
                 }
 
+                // Без времени (просто "Сегодня" / "Вчера")
                 if (createTime == default)
-                    continue;
+                {
+                    if (Regex.IsMatch(row, @">\s*Сегодня\s*<", RegexOptions.IgnoreCase))
+                        createTime = DateTime.Today;
+                    else if (Regex.IsMatch(row, @">\s*Вчера\s*<", RegexOptions.IgnoreCase))
+                        createTime = DateTime.Today.AddDays(-1);
+                }
+
+                // Явная дата вида 2025-10-03
+                if (createTime == default)
+                {
+                    string _create = Match(@">([0-9]{4}\-[0-9]{2}\-[0-9]{2})<").Replace("-", " ");
+                    if (DateTime.TryParseExact(_create, "yyyy MM dd", new CultureInfo("ru-RU"), DateTimeStyles.None, out var dt))
+                        createTime = dt;
+                }
+
+                if (createTime == default) continue;
                 #endregion
 
-                #region Данные раздачи
-                string url = Match("<a name=\"search_select\" [^>]+ href=\"/([0-9]+/[^\"]+)\"");
-                string title = Match("<a name=\"search_select\" [^>]+>([^<]+)</a>");
-                string _sid = Match("<font color=\"green\">&uarr; ([0-9]+)</font>");
-                string _pir = Match("<font color=\"red\">&darr; ([0-9]+)</font>");
-                string sizeName = Match("</td><td style=\"white-space:nowrap;\">([^<]+)</td>");
-                string magnet = Match("href=\"(magnet:\\?xt=[^\"]+)\"");
+                #region link + title (relative/absolute, без привязки к name="search_select")
+                string fullUrl = null;
 
-                if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(_sid) || string.IsNullOrWhiteSpace(_pir) || string.IsNullOrWhiteSpace(sizeName) || string.IsNullOrWhiteSpace(magnet))
-                    continue;
+                // абсолютный href на домен torrent.by
+                string hrefAbs = Match(@"<a[^>]+href=""(https?:\/\/(?:www\.)?torrent\.by\/[^""]+)""");
+                if (!string.IsNullOrEmpty(hrefAbs))
+                {
+                    fullUrl = hrefAbs;
+                }
+                else
+                {
+                    // относительный
+                    string pathRel = Match(@"<a[^>]+href=""\/([^""]+)""");
+                    if (!string.IsNullOrEmpty(pathRel))
+                        fullUrl = $"{AppInit.conf.TorrentBy.host}/{pathRel}";
+                }
+                if (string.IsNullOrEmpty(fullUrl)) continue;
 
-                url = $"{AppInit.conf.TorrentBy.host}/{url}";
+                // title
+                string rawTitle = Match(@"<a[^>]*>([^<]+)</a>");
+                string title = StripTags(rawTitle);
+                if (string.IsNullOrEmpty(title)) continue;
                 #endregion
 
-                #region Парсим раздачи
-                int relased = 0;
+                #region other data
+                // magnet (берём первый)
+                string magnet = Match(@"href=""(magnet:[^""]+)""");
+                if (string.IsNullOrEmpty(magnet)) continue;
+                magnet = WebUtility.UrlDecode(HtmlDecode(magnet));
+
+                // размер — первая ячейка <td>, начинающаяся с текста, а не с тега
+                string sizeName = Match(@"</td>\s*<td[^>]*>\s*([^<][^<]*)</td>");
+
+                // сиды/пиры
+                string _sid = Match(@"<font[^>]*color=""green""[^>]*>[^0-9]*([0-9]+)</font>");
+                string _pir = Match(@"<font[^>]*color=""red""[^>]*>[^0-9]*([0-9]+)</font>");
+                int.TryParse(_sid, out int sid);
+                int.TryParse(_pir, out int pir);
+
+                // try extract names / year: "Name / Original (2025) ..."
                 string name = null, originalname = null;
-
-                if (cat == "films")
+                int relased = 0;
+                var g = Regex.Match(title, @"^\s*(?<ru>[^/]+?)(?:\s*/\s*(?<en>[^/]+?))?\s*\((?<y>\d{4})", RegexOptions.Singleline);
+                if (g.Success)
                 {
-                    #region Зарубежные фильмы
-                    // Код бессмертия / Код молодости / Eternal Code (2019)
-                    var g = Regex.Match(title, "^([^/\\(]+) / [^/]+ / ([^/\\(]+) \\(([0-9]{4})\\)").Groups;
-                    if (!string.IsNullOrWhiteSpace(g[1].Value) && !string.IsNullOrWhiteSpace(g[2].Value) && !string.IsNullOrWhiteSpace(g[3].Value))
-                    {
-                        name = g[1].Value;
-                        originalname = g[2].Value;
-
-                        if (int.TryParse(g[3].Value, out int _yer))
-                            relased = _yer;
-                    }
-                    else
-                    {
-                        // Брешь / Breach (2020)
-                        g = Regex.Match(title, "^([^/\\(]+) / ([^/\\(]+) \\(([0-9]{4})\\)").Groups;
-
-                        name = g[1].Value;
-                        originalname = g[2].Value;
-
-                        if (int.TryParse(g[3].Value, out int _yer))
-                            relased = _yer;
-                    }
-                    #endregion
-                }
-                else if (cat == "movies")
-                {
-                    #region Наши фильмы
-                    // Временная связь (2020)
-                    // Приключения принца Флоризеля / Клуб самоубийц или Приключения титулованной особы (1979)
-                    var g = Regex.Match(title, "^([^/\\(]+) (/ [^/\\(]+)?\\(([0-9]{4})\\)").Groups;
-                    name = g[1].Value;
-
-                    if (int.TryParse(g[3].Value, out int _yer))
-                        relased = _yer;
-                    #endregion
-                }
-                else if (cat == "serials")
-                {
-                    #region Сериалы
-                    // Голяк / Без гроша / Без денег / Brassic [S04] (2022) WEB-DLRip | Ozz
-                    var g = Regex.Match(title, "^([^/\\(\\[]+) / [^/]+ / [^/]+ / ([^/\\(\\[]+) \\[[^\\]]+\\] +\\(([0-9]{4})(\\)|-)").Groups;
-                    if (!string.IsNullOrWhiteSpace(g[1].Value) && !string.IsNullOrWhiteSpace(g[2].Value) && !string.IsNullOrWhiteSpace(g[3].Value))
-                    {
-                        name = g[1].Value;
-                        originalname = g[2].Value;
-
-                        if (int.TryParse(g[3].Value, out int _yer))
-                            relased = _yer;
-                    }
-                    else
-                    {
-                        // Перевал / Der Pass / Pagan Peak [S01] (2018)
-                        g = Regex.Match(title, "^([^/\\(\\[]+) / [^/]+ / ([^/\\(\\[]+) \\[[^\\]]+\\] +\\(([0-9]{4})(\\)|-)").Groups;
-                        if (!string.IsNullOrWhiteSpace(g[1].Value) && !string.IsNullOrWhiteSpace(g[2].Value) && !string.IsNullOrWhiteSpace(g[3].Value))
-                        {
-                            name = g[1].Value;
-                            originalname = g[2].Value;
-
-                            if (int.TryParse(g[3].Value, out int _yer))
-                                relased = _yer;
-                        }
-                        else
-                        {
-                            // Стража / The Watch [01x01-05 из 08] (2020)
-                            g = Regex.Match(title, "^([^/\\(\\[]+) / ([^/\\[]+) \\[[^\\]]+\\] +\\(([0-9]{4})(\\)|-)").Groups;
-                            if (!string.IsNullOrWhiteSpace(g[1].Value) && !string.IsNullOrWhiteSpace(g[2].Value) && !string.IsNullOrWhiteSpace(g[3].Value))
-                            {
-                                name = g[1].Value;
-                                originalname = g[2].Value;
-
-                                if (int.TryParse(g[3].Value, out int _yer))
-                                    relased = _yer;
-                            }
-                            else
-                            {
-                                // Стажёры [01-10 из 24] (2019)
-                                g = Regex.Match(title, "^([^/\\(\\[]+) \\[[^\\]]+\\] +\\(([0-9]{4})(\\)|-)").Groups;
-
-                                name = g[1].Value;
-                                if (int.TryParse(g[2].Value, out int _yer))
-                                    relased = _yer;
-                            }
-                        }
-                    }
-                    #endregion
-                }
-                else if (cat == "cartoons" || cat == "anime" || cat == "tv" || cat == "humor" || cat == "sport")
-                {
-                    #region Мультфильмы / Аниме / Телевизор / Юмор / Спорт
-                    if (title.Contains(" / "))
-                    {
-                        if (title.Contains("[") && title.Contains("]"))
-                        {
-                            // 	Разочарование / еще название / Disenchantment [S03] (2021)
-                            var g = Regex.Match(title, "^([^/]+) / [^/]+ / ([^/\\[]+) \\[[^\\]]+\\] +\\(([0-9]{4})(\\)|-)").Groups;
-                            if (!string.IsNullOrWhiteSpace(g[1].Value) && !string.IsNullOrWhiteSpace(g[2].Value) && !string.IsNullOrWhiteSpace(g[3].Value))
-                            {
-                                name = g[1].Value;
-                                originalname = g[2].Value;
-
-                                if (int.TryParse(g[3].Value, out int _yer))
-                                    relased = _yer;
-                            }
-                            else
-                            {
-                                // 	Разочарование / Disenchantment [S03] (2021)
-                                g = Regex.Match(title, "^([^/]+) / ([^/\\[]+) \\[[^\\]]+\\] +\\(([0-9]{4})(\\)|-)").Groups;
-
-                                name = g[1].Value;
-                                originalname = g[2].Value;
-
-                                if (int.TryParse(g[3].Value, out int _yer))
-                                    relased = _yer;
-                            }
-                        }
-                        else
-                        {
-                            // 	Душа / еще название / Soul (2020)
-                            var g = Regex.Match(title, "^([^/\\(]+) / [^/]+ / ([^/\\(]+) \\(([0-9]{4})(\\)|-)").Groups;
-                            if (!string.IsNullOrWhiteSpace(g[1].Value) && !string.IsNullOrWhiteSpace(g[2].Value) && !string.IsNullOrWhiteSpace(g[3].Value))
-                            {
-                                name = g[1].Value;
-                                originalname = g[2].Value;
-
-                                if (int.TryParse(g[3].Value, out int _yer))
-                                    relased = _yer;
-                            }
-                            else
-                            {
-                                // Душа / Soul (2020)
-                                // Галактики / Galaxies (2017-2019)
-                                g = Regex.Match(title, "^([^/\\(]+) / ([^/\\(]+) \\(([0-9]{4})(\\)|-)").Groups;
-
-                                name = g[1].Value;
-                                originalname = g[2].Value;
-
-                                if (int.TryParse(g[3].Value, out int _yer))
-                                    relased = _yer;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if (title.Contains("[") && title.Contains("]"))
-                        {
-                            // 	Непокоренные [01-04 из 04] (2020)
-                            var g = Regex.Match(title, "^([^/\\[]+) \\[[^\\]]+\\] +\\(([0-9]{4})(\\)|-)").Groups;
-                            name = g[1].Value;
-
-                            if (int.TryParse(g[2].Value, out int _yer))
-                                relased = _yer;
-                        }
-                        else
-                        {
-                            // Душа (2020)
-                            var g = Regex.Match(title, "^([^/\\(]+) \\(([0-9]{4})(\\)|-)").Groups;
-                            name = g[1].Value;
-
-                            if (int.TryParse(g[2].Value, out int _yer))
-                                relased = _yer;
-                        }
-                    }
-                    #endregion
+                    name = tParse.ReplaceBadNames(g.Groups["ru"].Value).Trim();
+                    originalname = tParse.ReplaceBadNames(g.Groups["en"].Value).Trim();
+                    int.TryParse(g.Groups["y"].Value, out relased);
                 }
                 #endregion
 
-                if (string.IsNullOrWhiteSpace(name))
-                    name = Regex.Split(title, "(\\[|\\/|\\(|\\|)", RegexOptions.IgnoreCase)[0].Trim();
+                #region types
+                var types = MapTypes(cat);
+                #endregion
 
-                if (!string.IsNullOrWhiteSpace(name))
+                torrents.Add(new TorrentBaseDetails()
                 {
-                    #region types
-                    string[] types = null;
-                    switch (cat)
-                    {
-                        case "films":
-                        case "movies":
-                            types = new string[] { "movie" };
-                            break;
-                        case "serials":
-                            types = new string[] { "serial" };
-                            break;
-                        case "tv":
-                        case "humor":
-                            types = new string[] { "tvshow" };
-                            break;
-                        case "cartoons":
-                            types = new string[] { "multfilm", "multserial" };
-                            break;
-                        case "anime":
-                            types = new string[] { "anime" };
-                            break;
-                        case "sport":
-                            types = new string[] { "sport" };
-                            break;
-                    }
-
-                    if (types == null)
-                        continue;
-                    #endregion
-
-                    int.TryParse(_sid, out int sid);
-                    int.TryParse(_pir, out int pir);
-
-                    torrents.Add(new TorrentBaseDetails()
-                    {
-                        trackerName = "torrentby",
-                        types = types,
-                        url = url,
-                        title = title,
-                        sid = sid,
-                        pir = pir,
-                        sizeName = sizeName,
-                        magnet = magnet,
-                        createTime = createTime,
-                        name = name,
-                        originalname = originalname,
-                        relased = relased
-                    });
-                }
+                    trackerName = "torrentby",
+                    types = types,
+                    url = fullUrl,
+                    title = title,
+                    sid = sid,
+                    pir = pir,
+                    sizeName = sizeName,
+                    magnet = magnet,
+                    createTime = createTime,
+                    name = name,
+                    originalname = originalname,
+                    relased = relased
+                });
             }
 
             FileDB.AddOrUpdate(torrents);
