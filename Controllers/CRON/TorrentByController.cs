@@ -187,7 +187,8 @@ namespace JacRed.Controllers.CRON
         #endregion
 
         #region Helpers
-        static readonly string[] categories = new[] { "films", "movies", "serials", "tv", "humor", "cartoons", "anime", "sport" };
+        // с категорией "series"
+        static readonly string[] categories = new[] { "films", "movies", "serials", "series", "tv", "humor", "cartoons", "anime", "sport" };
 
         static string[] MapTypes(string cat)
         {
@@ -196,6 +197,7 @@ namespace JacRed.Controllers.CRON
                 case "films":
                 case "movies":
                     return new[] { "movie" };
+                case "series":
                 case "serials":
                     return new[] { "serial" };
                 case "tv":
@@ -223,14 +225,35 @@ namespace JacRed.Controllers.CRON
 
         static string HtmlDecode(string s) => string.IsNullOrEmpty(s) ? s : HttpUtility.HtmlDecode(s);
         static string StripTags(string s) => string.IsNullOrEmpty(s) ? s : Regex.Replace(s, "<.*?>", string.Empty);
+
+        static string NormalizeUrlToHost(string anyHref)
+        {
+            if (string.IsNullOrWhiteSpace(anyHref)) return null;
+
+            try
+            {
+                if (anyHref.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+                {
+                    var abs = new Uri(anyHref, UriKind.Absolute);
+                    var baseU = new Uri(AppInit.conf.TorrentBy.host, UriKind.Absolute);
+                    return $"{baseU.Scheme}://{baseU.Host}{abs.AbsolutePath}";
+                }
+
+                if (anyHref.StartsWith("/"))
+                    return $"{AppInit.conf.TorrentBy.host}{anyHref}";
+            }
+            catch { }
+
+            return null;
+        }
         #endregion
 
         #region Parse (manual)
         static bool workParse = false;
 
-        // /cron/torrentby/parse?page=1
+        // /cron/torrentby/parse?page=0
         [HttpGet]
-        public async Task<string> Parse(int page = 1)
+        public async Task<string> Parse(int page = 0)  // по умолчанию 0
         {
             if (workParse) return "work";
             workParse = true;
@@ -242,8 +265,8 @@ namespace JacRed.Controllers.CRON
 
                 foreach (var cat in categories)
                 {
-                    bool ok = await parsePage(cat, page);
-                    sb.AppendLine($"{cat} - {(ok ? "ok" : "empty")}");
+                    var (ok, ins, upd) = await parsePage(cat, page);
+                    sb.AppendLine($"{cat} - {(ok ? "ok" : "empty")} (ins: {ins}, upd: {upd})");
                     await DelayWithJitter();
                 }
             }
@@ -271,13 +294,13 @@ namespace JacRed.Controllers.CRON
             {
                 await EnsureLogin();
 
-                // init pages plan if empty
+                // init pages plan if empty -> 0..9
                 lock (taskLock)
                 {
                     foreach (var cat in categories)
                     {
                         if (!taskParse.ContainsKey(cat))
-                            taskParse[cat] = Enumerable.Range(1, 10).Select(p => new TaskParse(p)).ToList();
+                            taskParse[cat] = Enumerable.Range(0, 10).Select(p => new TaskParse(p)).ToList();
                     }
                 }
 
@@ -288,8 +311,8 @@ namespace JacRed.Controllers.CRON
                         if (tp.updateTime.Date == DateTime.Today)
                             continue;
 
-                        bool res = await parsePage(kv.Key, tp.page);
-                        if (res)
+                        var (ok, _, __) = await parsePage(kv.Key, tp.page);
+                        if (ok)
                             tp.updateTime = DateTime.Today;
 
                         await DelayWithJitter();
@@ -337,8 +360,8 @@ namespace JacRed.Controllers.CRON
                             if (DateTime.Today == val.updateTime)
                                 continue;
 
-                            bool res = await parsePage(task.Key, val.page);
-                            if (res)
+                            var (ok, _, __) = await parsePage(task.Key, val.page);
+                            if (ok)
                                 val.updateTime = DateTime.Today;
 
                             await DelayWithJitter();
@@ -363,8 +386,46 @@ namespace JacRed.Controllers.CRON
         }
         #endregion
 
+        #region ResetTasksPlan
+        // /cron/torrentby/ResetTasksPlan
+        [HttpGet]
+        public string ResetTasksPlan()
+        {
+            try
+            {
+                lock (taskLock)
+                {
+                    // пересобираем план 0..9
+                    var fresh = new Dictionary<string, List<TaskParse>>();
+                    foreach (var cat in categories)
+                        fresh[cat] = Enumerable.Range(0, 10).Select(p => new TaskParse(p)).ToList();
+
+                    taskParse = fresh;
+                }
+
+                // удаляем старый файл, затем сохраняем новый
+                try
+                {
+                    IO.Directory.CreateDirectory("Data/temp");
+                    if (IO.File.Exists("Data/temp/torrentby_taskParse.json"))
+                        IO.File.Delete("Data/temp/torrentby_taskParse.json");
+
+                    IO.File.WriteAllText("Data/temp/torrentby_taskParse.json", JsonConvert.SerializeObject(taskParse));
+                }
+                catch { }
+
+                return "ok";
+            }
+            catch
+            {
+                return "error";
+            }
+        }
+        #endregion
+
         #region parsePage
-        async Task<bool> parsePage(string cat, int page)
+        // Возвращает: ok, inserted, updated
+        async Task<(bool ok, int inserted, int updated)> parsePage(string cat, int page)
         {
             var cookie = LoadCookie(memoryCache);
 
@@ -384,9 +445,9 @@ namespace JacRed.Controllers.CRON
                 });
 
             if (html == null)
-                return false;
+                return (false, 0, 0);
 
-            // If we got login page, try re-login once
+            // Если пришла страница логина — релогин и ещё раз
             if (html.Contains("name=\"username\"") && html.Contains("name=\"password\""))
             {
                 await TakeLogin();
@@ -396,101 +457,102 @@ namespace JacRed.Controllers.CRON
                     useproxy: AppInit.conf.TorrentBy.useproxy,
                     cookie: LoadCookie(memoryCache));
                 if (html == null)
-                    return false;
+                    return (false, 0, 0);
             }
 
             var torrents = new List<TorrentBaseDetails>();
-            foreach (string row in tParse.ReplaceBadNames(html).Split("<tr class=\"ttable_col").Skip(1))
+
+            // Устойчиво собираем строки таблицы
+            var rowMatches = Regex.Matches(html, @"<tr[^>]*class\s*=\s*""ttable_col[^""]*""[^>]*>(.*?)</tr>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            foreach (Match rm in rowMatches)
             {
-                if (string.IsNullOrWhiteSpace(row) || !row.Contains("magnet:?xt=urn"))
+                string row = tParse.ReplaceBadNames(rm.Groups[1].Value);
+                if (string.IsNullOrWhiteSpace(row))
                     continue;
 
-                string Match(string pattern, int index = 1)
+                // Магнит должен быть в списке (по условию)
+                var mMag = Regex.Match(row, @"href\s*=\s*['""]\s*(magnet:[^'""]+)['""]", RegexOptions.IgnoreCase);
+                if (!mMag.Success)
+                    continue;
+
+                string magnet = WebUtility.UrlDecode(HtmlDecode(mMag.Groups[1].Value));
+                if (string.IsNullOrWhiteSpace(magnet))
+                    continue;
+
+                // Ссылка и заголовок (не magnet)
+                string hrefAny = null, title = null;
+
+                var mHrefTitle = Regex.Match(row,
+                    @"<a[^>]+href\s*=\s*['""](?!magnet:)(https?:\/\/[^'""]+|\/[^'""]+)['""][^>]*>([^<]+)</a>",
+                    RegexOptions.IgnoreCase | RegexOptions.Singleline);
+                if (mHrefTitle.Success)
                 {
-                    var m = new Regex(pattern, RegexOptions.IgnoreCase | RegexOptions.Singleline).Match(row);
-                    string res = HtmlDecode(m.Groups.Count > index ? m.Groups[index].Value : string.Empty);
-                    res = Regex.Replace(res ?? string.Empty, "[\\n\\r\\t ]+", " ");
-                    return res.Trim();
+                    hrefAny = HtmlDecode(mHrefTitle.Groups[1].Value);
+                    title = StripTags(HtmlDecode(mHrefTitle.Groups[2].Value));
+                }
+                else
+                {
+                    // fallback: сначала href, потом любой текстовый <a>
+                    var mHref = Regex.Match(row, @"<a[^>]+href\s*=\s*['""](https?:\/\/[^'""]+|\/[^'""]+)['""][^>]*>", RegexOptions.IgnoreCase);
+                    if (mHref.Success)
+                        hrefAny = HtmlDecode(mHref.Groups[1].Value);
+
+                    var mTitle = Regex.Match(row, @"<a[^>]*>([^<]+)</a>", RegexOptions.IgnoreCase);
+                    if (mTitle.Success)
+                        title = StripTags(HtmlDecode(mTitle.Groups[1].Value));
                 }
 
-                #region created
+                string fullUrl = NormalizeUrlToHost(hrefAny);
+                if (string.IsNullOrEmpty(fullUrl) || string.IsNullOrEmpty(title))
+                    continue;
+
+                // Размер
+                string sizeName = Regex.Match(row, @"</td>\s*<td[^>]*>\s*([^<]+)\s*</td>", RegexOptions.IgnoreCase | RegexOptions.Singleline).Groups[1].Value.Trim();
+                if (string.IsNullOrWhiteSpace(sizeName))
+                {
+                    var mSize2 = Regex.Match(row, @">\s*([0-9\.,]+\s*(?:TB|GB|MB|KiB|MiB|GiB))\s*<", RegexOptions.IgnoreCase);
+                    if (mSize2.Success) sizeName = mSize2.Groups[1].Value.Trim();
+                }
+
+                // Сиды/пиры
+                int sid = 0, pir = 0;
+                int.TryParse(Regex.Match(row, @"<font[^>]*color\s*=\s*""green""[^>]*>[^0-9]*([0-9]+)</font>", RegexOptions.IgnoreCase).Groups[1].Value, out sid);
+                int.TryParse(Regex.Match(row, @"<font[^>]*color\s*=\s*""red""[^>]*>[^0-9]*([0-9]+)</font>", RegexOptions.IgnoreCase).Groups[1].Value, out pir);
+
+                // Дата: Сегодня/Вчера [+ время], или  YYYY-MM-DD[ HH:MM] / YYYY.MM.DD[ HH:MM]
                 DateTime createTime = default;
 
-                // Сегодня / Вчера с временем
-                var mToday = Regex.Match(row, @">Сегодня,?\s*([0-9]{2}):([0-9]{2})<", RegexOptions.IgnoreCase);
+                var mToday = Regex.Match(row, @"сегодня[^0-9]*([0-9]{2}):([0-9]{2})", RegexOptions.IgnoreCase);
+                var mYesterday = Regex.Match(row, @"вчера[^0-9]*([0-9]{2}):([0-9]{2})", RegexOptions.IgnoreCase);
                 if (mToday.Success && int.TryParse(mToday.Groups[1].Value, out int th) && int.TryParse(mToday.Groups[2].Value, out int tm))
-                {
                     createTime = DateTime.Today.AddHours(th).AddMinutes(tm);
-                }
+                else if (mYesterday.Success && int.TryParse(mYesterday.Groups[1].Value, out int yh) && int.TryParse(mYesterday.Groups[2].Value, out int ym))
+                    createTime = DateTime.Today.AddDays(-1).AddHours(yh).AddMinutes(ym);
                 else
                 {
-                    var mYesterday = Regex.Match(row, @">Вчера,?\s*([0-9]{2}):([0-9]{2})<", RegexOptions.IgnoreCase);
-                    if (mYesterday.Success && int.TryParse(mYesterday.Groups[1].Value, out int yh) && int.TryParse(mYesterday.Groups[2].Value, out int ym))
+                    if (Regex.IsMatch(row, @"\bсегодня\b", RegexOptions.IgnoreCase)) createTime = DateTime.Today;
+                    else if (Regex.IsMatch(row, @"\bвчера\b", RegexOptions.IgnoreCase)) createTime = DateTime.Today.AddDays(-1);
+                    else
                     {
-                        createTime = DateTime.Today.AddDays(-1).AddHours(yh).AddMinutes(ym);
+                        // YYYY-MM-DD [HH:MM]  или  YYYY.MM.DD [HH:MM]
+                        var mDate = Regex.Match(row,
+                            @"([0-9]{4})[.\-]([0-9]{2})[.\-]([0-9]{2})(?:\s*&nbsp;\s*|\s+)?(?:(\d{2}):(\d{2}))?",
+                            RegexOptions.IgnoreCase);
+                        if (mDate.Success)
+                        {
+                            int y = int.Parse(mDate.Groups[1].Value);
+                            int mo = int.Parse(mDate.Groups[2].Value);
+                            int d = int.Parse(mDate.Groups[3].Value);
+                            int hh = 0, mm = 0;
+                            if (mDate.Groups[4].Success) int.TryParse(mDate.Groups[4].Value, out hh);
+                            if (mDate.Groups[5].Success) int.TryParse(mDate.Groups[5].Value, out mm);
+                            try { createTime = new DateTime(y, mo, d, hh, mm, 0); } catch { }
+                        }
                     }
                 }
-
-                // Без времени (просто "Сегодня" / "Вчера")
-                if (createTime == default)
-                {
-                    if (Regex.IsMatch(row, @">\s*Сегодня\s*<", RegexOptions.IgnoreCase))
-                        createTime = DateTime.Today;
-                    else if (Regex.IsMatch(row, @">\s*Вчера\s*<", RegexOptions.IgnoreCase))
-                        createTime = DateTime.Today.AddDays(-1);
-                }
-
-                // Явная дата вида 2025-10-03
-                if (createTime == default)
-                {
-                    string _create = Match(@">([0-9]{4}\-[0-9]{2}\-[0-9]{2})<").Replace("-", " ");
-                    if (DateTime.TryParseExact(_create, "yyyy MM dd", new CultureInfo("ru-RU"), DateTimeStyles.None, out var dt))
-                        createTime = dt;
-                }
-
                 if (createTime == default) continue;
-                #endregion
 
-                #region link + title (relative/absolute, без привязки к name="search_select")
-                string fullUrl = null;
-
-                // абсолютный href на домен torrent.by
-                string hrefAbs = Match(@"<a[^>]+href=""(https?:\/\/(?:www\.)?torrent\.by\/[^""]+)""");
-                if (!string.IsNullOrEmpty(hrefAbs))
-                {
-                    fullUrl = hrefAbs;
-                }
-                else
-                {
-                    // относительный
-                    string pathRel = Match(@"<a[^>]+href=""\/([^""]+)""");
-                    if (!string.IsNullOrEmpty(pathRel))
-                        fullUrl = $"{AppInit.conf.TorrentBy.host}/{pathRel}";
-                }
-                if (string.IsNullOrEmpty(fullUrl)) continue;
-
-                // title
-                string rawTitle = Match(@"<a[^>]*>([^<]+)</a>");
-                string title = StripTags(rawTitle);
-                if (string.IsNullOrEmpty(title)) continue;
-                #endregion
-
-                #region other data
-                // magnet (берём первый)
-                string magnet = Match(@"href=""(magnet:[^""]+)""");
-                if (string.IsNullOrEmpty(magnet)) continue;
-                magnet = WebUtility.UrlDecode(HtmlDecode(magnet));
-
-                // размер — первая ячейка <td>, начинающаяся с текста, а не с тега
-                string sizeName = Match(@"</td>\s*<td[^>]*>\s*([^<][^<]*)</td>");
-
-                // сиды/пиры
-                string _sid = Match(@"<font[^>]*color=""green""[^>]*>[^0-9]*([0-9]+)</font>");
-                string _pir = Match(@"<font[^>]*color=""red""[^>]*>[^0-9]*([0-9]+)</font>");
-                int.TryParse(_sid, out int sid);
-                int.TryParse(_pir, out int pir);
-
-                // try extract names / year: "Name / Original (2025) ..."
+                // Названия/год
                 string name = null, originalname = null;
                 int relased = 0;
                 var g = Regex.Match(title, @"^\s*(?<ru>[^/]+?)(?:\s*/\s*(?<en>[^/]+?))?\s*\((?<y>\d{4})", RegexOptions.Singleline);
@@ -500,11 +562,8 @@ namespace JacRed.Controllers.CRON
                     originalname = tParse.ReplaceBadNames(g.Groups["en"].Value).Trim();
                     int.TryParse(g.Groups["y"].Value, out relased);
                 }
-                #endregion
 
-                #region types
                 var types = MapTypes(cat);
-                #endregion
 
                 torrents.Add(new TorrentBaseDetails()
                 {
@@ -523,8 +582,23 @@ namespace JacRed.Controllers.CRON
                 });
             }
 
-            FileDB.AddOrUpdate(torrents);
-            return torrents.Count > 0;
+            int inserted = 0, updated = 0;
+            if (torrents.Count > 0)
+            {
+                await FileDB.AddOrUpdate<TorrentBaseDetails>(
+                    torrents,
+                    async (tor, db) =>
+                    {
+                        if (db != null && db.ContainsKey(tor.url))
+                            updated++;
+                        else
+                            inserted++;
+                        return true;
+                    }
+                );
+            }
+
+            return (torrents.Count > 0, inserted, updated);
         }
         #endregion
     }
