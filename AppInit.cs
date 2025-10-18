@@ -115,6 +115,8 @@ namespace JacRed
         
         public TrackerSettings Anidub = new TrackerSettings("https://tr.anidub.com");
         
+        public TrackerSettings Leproduction = new TrackerSettings("https://www.le-production.tv");
+        
         public TrackerSettings Anistar = new TrackerSettings("https://anistar.org");
 
         public TrackerSettings Baibako = new TrackerSettings("http://baibako.tv");
